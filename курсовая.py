@@ -1,650 +1,435 @@
-# -*- coding: utf-8 -*-
 """
-Курсовая работа: Информационно-аналитическая система
-Вариант 20: Компания разработчик программного обеспечения
-Продукты: ERP, CRM, СУБД
+Информационно-аналитическая система: SaaS-метрики
+Архитектура: MVC, Strategy Pattern
+Задачи: Композитный индекс → Прогнозная модель выручки → Сценарный анализ (What-If)
+Стек: Python 3.8+, pandas, numpy, matplotlib, tkinter, scikit-learn
 """
-
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+import os, sys, json, warnings, datetime
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from scipy.optimize import linprog
-import os
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score, mean_absolute_error
 
-# ----------------------------------------------------------------------
-# Глобальные настройки графики
-plt.rcParams['font.size'] = 9
+warnings.filterwarnings('ignore')
 plt.style.use('seaborn-v0_8-whitegrid')
 
-# ----------------------------------------------------------------------
-# Главное окно приложения
-class MainApp(tk.Tk):
-    """Основное окно с меню выбора задач."""
-    def __init__(self):
-        super().__init__()
-        self.title("Информационно-аналитическая система (Компания разработчик ПО)")
-        self.geometry("550x400")
-        self.resizable(False, False)
+# ==================== КОНФИГУРАЦИЯ ====================
+FEATURES = [
+    "avg_subscription_price",
+    "active_users_count",
+    "is_major_update",
+    "support_response_time",
+    "feature_requests_satisfied_percent"
+]
+# 1 = больше лучше, -1 = меньше лучше
+DIRECTIONS = [1, 1, 1, -1, 1]  
+TARGET = "monthly_subscription_revenue"
+CONTROLLABLE = ["support_response_time", "feature_requests_satisfied_percent"]
 
-        # Заголовок
-        ttk.Label(self, text="Главное меню", font=("Arial", 14, "bold")).pack(pady=15)
+RU_NAMES = {
+    "avg_subscription_price": "Цена подписки (руб.)",
+    "active_users_count": "Активные пользователи (тыс.)",
+    "is_major_update": "Крупное обновление (0/1)",
+    "support_response_time": "Время ответа поддержки (мин.)",
+    "feature_requests_satisfied_percent": "Выполнение запросов (%)",
+    TARGET: "Выручка от подписок (тыс. руб.)"
+}
 
-        # Кнопки вызова модулей
-        ttk.Button(self, text="1. Оценка технического уровня продукции",
-                   command=self.open_evaluation, width=45).pack(pady=5)
-        ttk.Button(self, text="2. Прогноз динамики показателей",
-                   command=self.open_forecast, width=45).pack(pady=5)
-        ttk.Button(self, text="3. Оптимизация распределения ресурсов",
-                   command=self.open_optimization, width=45).pack(pady=5)
-        ttk.Button(self, text="4. Визуализация данных (дашборд)",
-                   command=self.open_dashboard, width=45).pack(pady=5)
-        ttk.Button(self, text="Выход", command=self.quit, width=45).pack(pady=20)
+# ==================== ЯДРА РАСЧЁТОВ (Strategy) ====================
+class IndexEngine:
+    @staticmethod
+    def normalize(df: pd.DataFrame, features: list, directions: list) -> pd.DataFrame:
+        df_norm = df.copy()
+        for i, col in enumerate(features):
+            mn, mx = df[col].min(), df[col].max()
+            if mx == mn:
+                df_norm[col] = 1.0
+                continue
+            vals = (df[col] - mn) / (mx - mn)
+            if directions[i] == -1:
+                vals = 1.0 - vals
+            df_norm[col] = vals
+        return df_norm
 
-    def open_evaluation(self):
-        """Открыть окно оценки технического уровня."""
-        EvaluationWindow(self)
+    @staticmethod
+    def calculate_composite_index(df_norm: pd.DataFrame, features: list, weights: np.ndarray) -> pd.Series:
+        return df_norm[features] @ weights
 
-    def open_forecast(self):
-        """Открыть окно прогнозирования."""
-        ForecastWindow(self)
+class ForecastEngine:
+    @staticmethod
+    def train_model(df: pd.DataFrame, features: list, target: str) -> dict:
+        X, y = df[features].values, df[target].values
+        model = LinearRegression()
+        model.fit(X, y)
+        y_pred = model.predict(X)
+        r2 = r2_score(y, y_pred)
+        mae = mean_absolute_error(y, y_pred)
+        return {
+            "model": model,
+            "r2": r2,
+            "mae": mae,
+            "coeffs": {f: c for f, c in zip(features, model.coef_)},
+            "intercept": model.intercept_,
+            "actual": y,
+            "predicted": y_pred
+        }
 
-    def open_optimization(self):
-        """Открыть окно оптимизации."""
-        OptimizationWindow(self)
+# ==================== ИНТЕРФЕЙС И КОНТРОЛЛЕР (MVC) ====================
+class SaaSAnalyticsApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("SaaS Аналитика: Индекс → Модель → Сценарии")
+        self.root.geometry("1280x950")
+        self.df = self.df_norm = None
+        self.index_scores = None
+        self.model_info = None
+        self.weights = np.ones(len(FEATURES)) / len(FEATURES)
 
-    def open_dashboard(self):
-        """Открыть окно дашборда."""
-        DashboardWindow(self)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+        self._build_ui()
 
+    def _on_closing(self):
+        plt.close('all')
+        self.root.destroy()
+        self.root.quit()
+        sys.exit(0)
 
-# ----------------------------------------------------------------------
-# Модуль 1: Оценка технического уровня
-class EvaluationWindow(tk.Toplevel):
-    """Окно для оценки качества продукции (ERP, CRM, СУБД)."""
-    def __init__(self, master):
-        super().__init__(master)
-        self.title("Оценка технического уровня продукции")
-        self.geometry("900x700")
-        self.minsize(700, 500)
+    def _build_ui(self):
+        # Настройка стиля для таблицы
+        style = ttk.Style()
+        style.configure("Treeview", font=('Segoe UI', 9), rowheight=25)
+        style.configure("Treeview.Heading", font=('Segoe UI', 9, 'bold'))
 
-        # Данные: список словарей с характеристиками образцов
-        self.samples = []          # Каждый элемент: {'name': ..., 'values': [x1, x2, ...]}
-        self.characteristics = []  # Названия характеристик (зависят от типа продукта)
-        self.etalon_values = []    # Эталонные (идеальные) значения характеристик
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(expand=True, fill='both', padx=10, pady=10)
+        self.tabs = [ttk.Frame(self.notebook) for _ in range(3)]
+        
+        titles = [
+            "Оценка композитного индекса",
+            "Прогнозная модель показателей",
+            "Сценарный анализ улучшений"
+        ]
+        for t, title in zip(self.tabs, titles):
+            self.notebook.add(t, text=title)
+            
+        self._setup_tab_index()
+        self._setup_tab_forecast()
+        self._setup_tab_scenario()
 
-        # Переменная для типа продукта
-        self.product_type = tk.StringVar(value="ERP")
+    # ==================== ВКЛАДКА 1: ИНДЕКС ====================
+    def _setup_tab_index(self):
+        f = ttk.Frame(self.tabs[0])
+        f.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        top = ttk.Frame(f)
+        top.pack(fill='x', pady=5)
+        ttk.Button(top, text="📂 Загрузить данные", command=self._load_data).pack(side='left', padx=5)
+        ttk.Button(top, text="▶ Рассчитать индекс", command=self._calc_index).pack(side='left', padx=5)
+        ttk.Button(top, text="📤 Экспорт JSON", command=self._export_json).pack(side='right', padx=5)
+        self.lbl_status = ttk.Label(top, text="Ожидание данных...", foreground="gray")
+        self.lbl_status.pack(side='right', padx=10)
 
-        # Создание интерфейса
-        self.create_widgets()
+        # Таблица со скроллбаром
+        tree_frame = ttk.Frame(f)
+        tree_frame.pack(fill='both', expand=True, pady=5)
+        
+        self.tree = ttk.Treeview(tree_frame, show='headings', height=10)
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        hsb.grid(row=1, column=0, sticky='ew')
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
 
-    def create_widgets(self):
-        """Построить элементы управления."""
-        # Верхняя панель выбора типа
-        top_frame = ttk.Frame(self)
-        top_frame.pack(fill=tk.X, padx=10, pady=5)
+        # Графики
+        self.fig_idx, (self.ax_r, self.ax_b) = plt.subplots(1, 2, figsize=(10, 4))
+        self.canvas_idx = FigureCanvasTkAgg(self.fig_idx, f)
+        self.canvas_idx.get_tk_widget().pack(fill='both', expand=True, pady=5)
 
-        ttk.Label(top_frame, text="Тип продукции:").pack(side=tk.LEFT)
-        type_combo = ttk.Combobox(top_frame, textvariable=self.product_type,
-                                  values=["ERP", "CRM", "СУБД"], state="readonly", width=10)
-        type_combo.pack(side=tk.LEFT, padx=5)
-        type_combo.bind("<<ComboboxSelected>>", self.on_type_changed)
+    # ==================== ВКЛАДКА 2: ПРОГНОЗ ====================
+    def _setup_tab_forecast(self):
+        f = ttk.LabelFrame(self.tabs[1], text="Регрессионная модель: Метрики → Выручка")
+        f.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        info_frame = ttk.Frame(f)
+        info_frame.pack(fill='x', pady=10)
+        self.lbl_model = ttk.Label(info_frame, text="Загрузите CSV для обучения модели", foreground="gray", justify='left')
+        self.lbl_model.pack(fill='x', padx=10)
+        
+        ttk.Button(f, text="🔄 Обучить / Обновить модель", command=self._train_and_show_forecast).pack(pady=5)
 
-        ttk.Button(top_frame, text="Загрузить из CSV", command=self.load_csv).pack(side=tk.LEFT, padx=10)
-        ttk.Button(top_frame, text="Сбросить данные", command=self.reset_data).pack(side=tk.LEFT)
+        self.fig_fc, self.ax_fc = plt.subplots(figsize=(9, 4))
+        self.canvas_fc = FigureCanvasTkAgg(self.fig_fc, f)
+        self.canvas_fc.get_tk_widget().pack(fill='both', expand=True, padx=5, pady=5)
 
-        # Панель ручного ввода
-        input_frame = ttk.LabelFrame(self, text="Ручной ввод образца")
-        input_frame.pack(fill=tk.X, padx=10, pady=5)
+    # ==================== ВКЛАДКА 3: СЦЕНАРИИ ====================
+    def _setup_tab_scenario(self):
+        f = ttk.LabelFrame(self.tabs[2], text="Симулятор: что будет, если улучшить управляемые метрики?")
+        f.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        base_frame = ttk.Frame(f)
+        base_frame.pack(fill='x', pady=5)
+        ttk.Label(base_frame, text="Базовые значения (средние по выборке):").pack(anchor='w', padx=10)
+        
+        self.entries = {}
+        ctrl_frame = ttk.Frame(f)
+        ctrl_frame.pack(fill='x', pady=5, padx=10)
+        
+        for i, met in enumerate(CONTROLLABLE):
+            row = ttk.Frame(ctrl_frame)
+            row.pack(fill='x', pady=3)
+            ttk.Label(row, text=f"{RU_NAMES[met]}:").pack(side='left')
+            ent = ttk.Entry(row, width=10)
+            ent.pack(side='left', padx=10)
+            self.entries[met] = ent
+            ttk.Label(row, text="(мин–макс:)").pack(side='left', padx=5)
+            rng = ttk.Label(row, text="")
+            rng.pack(side='left')
+            self.entries[f"{met}_range"] = rng
 
-        ttk.Label(input_frame, text="Название:").grid(row=0, column=0, padx=5, pady=5, sticky='e')
-        self.entry_name = tk.Entry(input_frame, width=20)
-        self.entry_name.grid(row=0, column=1, padx=5, pady=5)
+        ttk.Button(f, text="▶ Рассчитать сценарий", command=self._run_scenario).pack(pady=10)
+        self.lbl_scenario = ttk.Label(f, text="Введите параметры и нажмите кнопку", foreground="blue", justify='left')
+        self.lbl_scenario.pack(pady=5)
+        
+        self.fig_sc, self.ax_sc = plt.subplots(figsize=(9, 3))
+        self.canvas_sc = FigureCanvasTkAgg(self.fig_sc, f)
+        self.canvas_sc.get_tk_widget().pack(fill='both', expand=True)
 
-        ttk.Label(input_frame, text="Характеристики (через запятую):").grid(row=0, column=2, padx=5, pady=5, sticky='e')
-        self.entry_values = tk.Entry(input_frame, width=50)
-        self.entry_values.grid(row=0, column=3, padx=5, pady=5)
+    # ==================== ОБРАБОТЧИКИ ====================
+    def _load_data(self):
+        fp = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
+        if not fp: return
 
-        ttk.Button(input_frame, text="Добавить образец", command=self.add_sample).grid(row=0, column=4, padx=10)
+        # Сброс состояния всех вкладок
+        self.df = self.df_norm = None
+        self.index_scores = None
+        self.model_info = None
 
-        # Таблица для отображения добавленных образцов
-        table_frame = ttk.LabelFrame(self, text="Список образцов")
-        table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        self.tree = ttk.Treeview(table_frame, show='headings', height=6)
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-
-        # Кнопка выполнения оценки
-        ttk.Button(self, text="Выполнить оценку и построить диаграммы",
-                   command=self.evaluate_and_plot).pack(pady=10)
-
-        # Область для графиков
-        self.plot_frame = ttk.Frame(self)
-        self.plot_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        # Инициализация характеристик по умолчанию
-        self.on_type_changed()
-
-    def on_type_changed(self, event=None):
-        """Обновить названия характеристик и эталон при смене типа продукта."""
-        ptype = self.product_type.get()
-        if ptype == "ERP":
-            self.characteristics = ["Модульность (кол-во)", "Время отклика (мс)",
-                                    "Макс. пользователей", "Надёжность (%)", "Стоимость (тыс. руб)"]
-            self.etalon_values = [10, 100, 1000, 99.9, 5000]  # эталонные значения
-        elif ptype == "CRM":
-            self.characteristics = ["Интеграций с API", "Время синхронизации (с)",
-                                    "Объём данных (ГБ)", "Удобство (балл)", "Цена (тыс. руб)"]
-            self.etalon_values = [20, 2, 100, 9.5, 3000]
-        elif ptype == "СУБД":
-            self.characteristics = ["Производительность (tps)", "Поддержка SQL стандартов",
-                                    "Масштабируемость", "Безопасность (сертификаты)", "Цена (тыс. руб)"]
-            self.etalon_values = [5000, 5, 10, 4, 4000]
-
-        # Обновить заголовки таблицы
-        self.update_tree_columns()
-        # Очистить данные, т.к. характеристики изменились
-        self.reset_data()
-
-    def update_tree_columns(self):
-        """Настроить столбцы таблицы в соответствии с характеристиками."""
         self.tree.delete(*self.tree.get_children())
-        cols = ["Название"] + self.characteristics
+
+        self.ax_r.clear()
+        self.ax_b.clear()
+        self.ax_fc.clear()
+        self.ax_sc.clear()
+
+        self.lbl_status.config(text="Ожидание данных...", foreground="gray")
+        self.lbl_model.config(text="Загрузите CSV для обучения модели", foreground="gray")
+        self.lbl_scenario.config(text="Введите параметры и нажмите кнопку", foreground="blue")
+
+        self.canvas_idx.draw()
+        self.canvas_fc.draw()
+        self.canvas_sc.draw()
+
+        try:
+            df = pd.read_csv(fp, sep=None, engine='python', encoding='utf-8-sig')
+            missing = [c for c in FEATURES + [TARGET] if c not in df.columns]
+            if missing:
+                raise ValueError(f"❌ Отсутствуют столбцы: {', '.join(missing)}")
+            
+            self.df = df[FEATURES + [TARGET]].copy()
+            
+            # Заполняем поля с точностью до 3 знаков
+            for met in CONTROLLABLE:
+                self.entries[met].delete(0, tk.END)
+                self.entries[met].insert(0, f"{self.df[met].mean():.3f}")
+                self.entries[f"{met}_range"].config(text=f"{self.df[met].min():.1f} – {self.df[met].max():.1f}")
+                
+            self._refresh_table()
+            self.lbl_status.config(text=f"✅ Загружено {len(self.df)} наблюдений", foreground="green")
+            messagebox.showinfo("Успех", "Датасет загружен. Рассчитайте индекс или обучите модель.")
+        except Exception as e:
+            messagebox.showerror("Ошибка загрузки", str(e))
+
+    def _refresh_table(self):
+        if self.df is None: return
+        self.tree.delete(*self.tree.get_children())
+        cols = list(self.df.columns)
         self.tree["columns"] = cols
-        self.tree.column("#0", width=0, stretch=False)
-        for col in cols:
-            self.tree.heading(col, text=col)
-            self.tree.column(col, width=120, anchor='center')
+        
+        col_widths = {
+            "avg_subscription_price": 130,
+            "active_users_count": 130,
+            "is_major_update": 90,
+            "support_response_time": 140,
+            "feature_requests_satisfied_percent": 140,
+            "monthly_subscription_revenue": 150
+        }
+        
+        for c in cols:
+            self.tree.heading(c, text=RU_NAMES.get(c, c))
+            width = col_widths.get(c, 120)
+            self.tree.column(c, width=width, anchor='center')
+        
+        for _, row in self.df.iterrows():
+            values = []
+            for i, col in enumerate(cols):
+                val = row[col]
+                if isinstance(val, (int, float)):
+                    values.append(f"{val:.1f}" if col != "is_major_update" else str(int(val)))
+                else:
+                    values.append(str(val))
+            self.tree.insert("", "end", values=values)
 
-    def reset_data(self):
-        """Очистить список образцов и таблицу."""
-        self.samples = []
-        self.tree.delete(*self.tree.get_children())
-
-    def load_csv(self):
-        """Загрузить данные из CSV-файла. Формат: первая колонка - название, остальные - значения характеристик."""
-        filepath = filedialog.askopenfilename(
-            title="Выберите CSV файл с характеристиками",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
-        )
-        if not filepath:
+    def _calc_index(self):
+        if self.df is None:
+            messagebox.showwarning("Внимание", "Сначала загрузите CSV")
             return
-        try:
-            df = pd.read_csv(filepath)
-            if df.shape[1] != len(self.characteristics) + 1:
-                messagebox.showerror("Ошибка", f"Файл должен содержать {len(self.characteristics)+1} колонок: название и {len(self.characteristics)} характеристик.")
-                return
-            # Очищаем текущие данные и добавляем из файла
-            self.samples = []
-            for _, row in df.iterrows():
-                name = str(row.iloc[0])
-                values = [float(row.iloc[i+1]) for i in range(len(self.characteristics))]
-                self.samples.append({"name": name, "values": values})
-            self.refresh_table()
-            messagebox.showinfo("Готово", f"Загружено {len(self.samples)} образцов.")
-        except Exception as e:
-            messagebox.showerror("Ошибка чтения", f"Не удалось прочитать файл:\n{e}")
-
-    def add_sample(self):
-        """Добавить образец из ручного ввода."""
-        name = self.entry_name.get().strip()
-        values_str = self.entry_values.get().strip()
-        if not name:
-            messagebox.showwarning("Внимание", "Введите название образца.")
-            return
-        if not values_str:
-            messagebox.showwarning("Внимание", "Введите значения характеристик.")
-            return
-        try:
-            values = [float(x.strip()) for x in values_str.split(',')]
-            if len(values) != len(self.characteristics):
-                messagebox.showerror("Ошибка", f"Должно быть {len(self.characteristics)} значений, введено {len(values)}.")
-                return
-            self.samples.append({"name": name, "values": values})
-            self.refresh_table()
-            self.entry_name.delete(0, tk.END)
-            self.entry_values.delete(0, tk.END)
-        except ValueError:
-            messagebox.showerror("Ошибка", "Некорректные числовые значения.")
-
-    def refresh_table(self):
-        """Обновить таблицу на основе self.samples."""
-        self.tree.delete(*self.tree.get_children())
-        for sample in self.samples:
-            row = [sample["name"]] + [str(v) for v in sample["values"]]
-            self.tree.insert("", tk.END, values=row)
-
-    def evaluate_and_plot(self):
-        """Рассчитать относительные показатели, построить радиальную и столбчатую диаграммы."""
-        if not self.samples:
-            messagebox.showwarning("Внимание", "Нет данных для оценки. Добавьте образцы.")
-            return
-
-        # Эталонные значения
-        etalon = np.array(self.etalon_values, dtype=float)
-
-        # Для каждого образца считаем относительные показатели:
-        # Для характеристик, где больше - лучше: относительное = значение / эталон (ограничено 1.0)
-        # Для цены (последняя характеристика) меньше - лучше: относительное = эталон / значение (ограничено 1.0)
-        # Здесь предполагаем, что все кроме последней - "больше-лучше", последняя - "цена (меньше-лучше)".
-        rel_indicators = []
-        names = []
-        for sample in self.samples:
-            vals = np.array(sample["values"], dtype=float)
-            rel = np.zeros(len(vals))
-            for i in range(len(vals)-1):  # все кроме последней
-                rel[i] = min(vals[i] / etalon[i], 1.0) if etalon[i] != 0 else 1.0
-            # цена
-            if etalon[-1] != 0:
-                rel[-1] = min(etalon[-1] / vals[-1], 1.0)
-            else:
-                rel[-1] = 1.0
-            rel_indicators.append(rel)
-            names.append(sample["name"])
-
-        # Расчёт технического уровня (качества) как среднее арифметическое относительных показателей
-        quality_scores = [np.mean(rel) for rel in rel_indicators]
-
-        # Очистка предыдущих графиков
-        for widget in self.plot_frame.winfo_children():
-            widget.destroy()
-
-        # Создание фигуры с двумя подграфиками
-        fig = plt.Figure(figsize=(9, 4), dpi=100)
-        # Радиальная диаграмма
-        ax1 = fig.add_subplot(121, projection='polar')
-        self._draw_radar(ax1, rel_indicators, names)
-
-        # Столбчатая диаграмма (сортировка по убыванию качества)
-        ax2 = fig.add_subplot(122)
-        sorted_indices = np.argsort(quality_scores)[::-1]
-        sorted_names = [names[i] for i in sorted_indices]
-        sorted_scores = [quality_scores[i] for i in sorted_indices]
-        bars = ax2.bar(sorted_names, sorted_scores, color='skyblue', edgecolor='navy')
-        ax2.set_ylim(0, 1.05)
-        ax2.set_ylabel("Технический уровень")
-        ax2.set_title("Сравнение технического уровня")
-        ax2.tick_params(axis='x', rotation=30)
-        # Добавить подписи значений над столбцами
-        for bar, score in zip(bars, sorted_scores):
-            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
-                     f"{score:.3f}", ha='center', va='bottom', fontsize=8)
-
-        fig.tight_layout()
-
-        canvas = FigureCanvasTkAgg(fig, master=self.plot_frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-    def _draw_radar(self, ax, rel_indicators, names):
-        """Нарисовать радиальную диаграмму с заданными относительными показателями."""
-        # Подготовка углов (по количеству характеристик)
-        num_vars = len(self.characteristics)
-        angles = np.linspace(0, 2 * np.pi, num_vars, endpoint=False).tolist()
-        angles += angles[:1]  # замыкание
-
-        # Для каждого образца
-        for i, rel in enumerate(rel_indicators):
-            values = rel.tolist()
-            values += values[:1]
-            ax.plot(angles, values, 'o-', linewidth=2, label=names[i])
-            ax.fill(angles, values, alpha=0.1)
-
-        # Настройка осей
-        ax.set_xticks(angles[:-1])
-        ax.set_xticklabels(self.characteristics, fontsize=8)
-        ax.set_ylim(0, 1)
-        ax.set_title("Относительные показатели", pad=20)
-        ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=8)
-
-
-# ----------------------------------------------------------------------
-# Модуль 2: Прогноз динамики показателей
-class ForecastWindow(tk.Toplevel):
-    """Окно прогнозирования методом линейной регрессии."""
-    def __init__(self, master):
-        super().__init__(master)
-        self.title("Прогноз динамики показателей")
-        self.geometry("800x600")
-        self.minsize(600, 400)
-
-        self.data = None          # DataFrame с колонками 'period', 'value'
-        self.forecast_result = None
-
-        self.create_widgets()
-
-    def create_widgets(self):
-        # Панель управления
-        control_frame = ttk.LabelFrame(self, text="Управление")
-        control_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        ttk.Button(control_frame, text="Загрузить данные из CSV", command=self.load_data).grid(row=0, column=0, padx=5, pady=5)
-        ttk.Label(control_frame, text="Периодов для прогноза:").grid(row=0, column=1, padx=5, pady=5)
-        self.periods_entry = tk.Entry(control_frame, width=5)
-        self.periods_entry.insert(0, "3")
-        self.periods_entry.grid(row=0, column=2, padx=5, pady=5)
-        ttk.Button(control_frame, text="Выполнить прогноз", command=self.run_forecast).grid(row=0, column=3, padx=5, pady=5)
-
-        # Таблица для отображения загруженных данных
-        table_frame = ttk.LabelFrame(self, text="Исходные данные")
-        table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        self.tree = ttk.Treeview(table_frame, show='headings', height=8)
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-
-        # Область графика
-        self.plot_frame = ttk.Frame(self)
-        self.plot_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-    def load_data(self):
-        """Загрузить временной ряд из CSV. Ожидаются колонки 'period' и 'value'."""
-        filepath = filedialog.askopenfilename(
-            title="Выберите CSV файл с данными",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
-        )
-        if not filepath:
-            return
-        try:
-            df = pd.read_csv(filepath)
-            if 'period' not in df.columns or 'value' not in df.columns:
-                messagebox.showerror("Ошибка", "Файл должен содержать колонки 'period' и 'value'.")
-                return
-            self.data = df[['period', 'value']].copy()
-            # Приведение period к строке или числу (для оси X)
-            self.refresh_table()
-        except Exception as e:
-            messagebox.showerror("Ошибка чтения", str(e))
-
-    def refresh_table(self):
-        """Отобразить данные в таблице."""
-        self.tree.delete(*self.tree.get_children())
-        if self.data is None:
-            return
-        self.tree["columns"] = ["period", "value"]
-        self.tree.column("#0", width=0, stretch=False)
-        self.tree.heading("period", text="Период")
-        self.tree.heading("value", text="Значение")
-        self.tree.column("period", width=150, anchor='center')
-        self.tree.column("value", width=150, anchor='center')
-        for _, row in self.data.iterrows():
-            self.tree.insert("", tk.END, values=(row['period'], row['value']))
-
-    def run_forecast(self):
-        """Выполнить прогноз линейной регрессией."""
-        if self.data is None or self.data.empty:
-            messagebox.showwarning("Нет данных", "Сначала загрузите данные.")
-            return
-        try:
-            n_periods = int(self.periods_entry.get())
-            if n_periods <= 0:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Ошибка", "Введите положительное целое число периодов.")
-            return
-
-        # Подготовка числовых индексов
-        x = np.arange(len(self.data)).reshape(-1, 1)
-        y = self.data['value'].values
-
-        # Линейная регрессия
-        coeffs = np.polyfit(x.flatten(), y, 1)
-        slope, intercept = coeffs
-
-        # Прогноз
-        last_idx = len(self.data)
-        future_x = np.arange(last_idx, last_idx + n_periods)
-        future_y = slope * future_x + intercept
-
-        # Подготовка для визуализации
-        all_x = np.arange(last_idx + n_periods)
-        trend_line = slope * all_x + intercept
-
-        # Очистка области графика
-        for widget in self.plot_frame.winfo_children():
-            widget.destroy()
-
-        fig = plt.Figure(figsize=(8, 4), dpi=100)
-        ax = fig.add_subplot(111)
-        ax.plot(x.flatten(), y, 'bo-', label='Исторические данные')
-        ax.plot(all_x, trend_line, 'g--', label='Тренд')
-        ax.plot(future_x, future_y, 'ro', label='Прогноз')
-        ax.set_xlabel("Период (индекс)")
-        ax.set_ylabel("Значение показателя")
-        ax.set_title("Прогноз динамики показателя")
-        ax.legend()
-        ax.grid(True)
-
-        canvas = FigureCanvasTkAgg(fig, master=self.plot_frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-        # Сохраняем результат для возможного использования в дашборде
-        self.forecast_result = {"future_x": future_x, "future_y": future_y}
-
-        # Вывод численного прогноза
-        pred_text = "\n".join([f"Период {i+1}: {val:.2f}" for i, val in enumerate(future_y)])
-        messagebox.showinfo("Результаты прогноза", f"Прогноз на {n_periods} периодов:\n{pred_text}")
-
-
-# ----------------------------------------------------------------------
-# Модуль 3: Оптимизация распределения ресурсов
-class OptimizationWindow(tk.Toplevel):
-    """Окно решения задачи линейного программирования."""
-    def __init__(self, master):
-        super().__init__(master)
-        self.title("Оптимизация распределения ресурсов")
-        self.geometry("700x600")
-        self.minsize(500, 400)
-
-        self.create_widgets()
-
-    def create_widgets(self):
-        # Пояснение
-        info_text = """Задача: распределить бюджет между тремя проектами (ERP, CRM, СУБД),
-чтобы максимизировать суммарную прибыль при ограничениях на минимальные
-и максимальные затраты, а также общий бюджет."""
-        ttk.Label(self, text=info_text, wraplength=600, justify='left').pack(pady=10)
-
-        # Ручной ввод параметров
-        param_frame = ttk.LabelFrame(self, text="Параметры задачи")
-        param_frame.pack(fill=tk.X, padx=20, pady=10)
-
-        # Общий бюджет
-        ttk.Label(param_frame, text="Общий бюджет (тыс. руб):").grid(row=0, column=0, padx=5, pady=5, sticky='e')
-        self.budget_entry = tk.Entry(param_frame, width=10)
-        self.budget_entry.insert(0, "1000")
-        self.budget_entry.grid(row=0, column=1, padx=5, pady=5, sticky='w')
-
-        # Прибыль на единицу затрат для каждого проекта
-        ttk.Label(param_frame, text="Прибыльность (ERP, CRM, СУБД):").grid(row=1, column=0, padx=5, pady=5, sticky='e')
-        self.profit_entry = tk.Entry(param_frame, width=25)
-        self.profit_entry.insert(0, "5, 4, 6")
-        self.profit_entry.grid(row=1, column=1, padx=5, pady=5, sticky='w')
-
-        # Минимальные вложения
-        ttk.Label(param_frame, text="Мин. вложения (ERP, CRM, СУБД):").grid(row=2, column=0, padx=5, pady=5, sticky='e')
-        self.min_entry = tk.Entry(param_frame, width=25)
-        self.min_entry.insert(0, "100, 100, 100")
-        self.min_entry.grid(row=2, column=1, padx=5, pady=5, sticky='w')
-
-        # Максимальные вложения
-        ttk.Label(param_frame, text="Макс. вложения (ERP, CRM, СУБД):").grid(row=3, column=0, padx=5, pady=5, sticky='e')
-        self.max_entry = tk.Entry(param_frame, width=25)
-        self.max_entry.insert(0, "600, 600, 600")
-        self.max_entry.grid(row=3, column=1, padx=5, pady=5, sticky='w')
-
-        ttk.Button(self, text="Решить задачу", command=self.solve).pack(pady=10)
-
-        # Область для вывода результатов
-        result_frame = ttk.LabelFrame(self, text="Результаты")
-        result_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
-
-        self.result_text = tk.Text(result_frame, height=12, wrap=tk.WORD)
-        self.result_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-    def solve(self):
-        """Решить задачу линейного программирования и вывести результат."""
-        try:
-            budget = float(self.budget_entry.get())
-            profits = [float(x.strip()) for x in self.profit_entry.get().split(',')]
-            mins = [float(x.strip()) for x in self.min_entry.get().split(',')]
-            maxs = [float(x.strip()) for x in self.max_entry.get().split(',')]
-
-            if len(profits) != 3 or len(mins) != 3 or len(maxs) != 3:
-                raise ValueError("Введите ровно 3 значения через запятую.")
-
-        except ValueError as e:
-            messagebox.showerror("Ошибка ввода", f"Некорректные числовые данные:\n{e}")
-            return
-
-        # Целевая функция: минимизация отрицательной прибыли (т.к. linprog минимизирует)
-        c = [-p for p in profits]  # коэффициенты целевой функции
-
-        # Ограничения:
-        # 1. x1 + x2 + x3 <= budget
-        A_ub = [[1, 1, 1]]
-        b_ub = [budget]
-
-        # Границы переменных
-        bounds = [(mins[i], maxs[i]) for i in range(3)]
-
-        # Решение
-        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-
-        self.result_text.delete(1.0, tk.END)
-        if res.success:
-            x = res.x
-            total_profit = -res.fun
-            result_str = "Оптимальное распределение бюджета (тыс. руб):\n"
-            result_str += f"  ERP:  {x[0]:.2f}\n"
-            result_str += f"  CRM:  {x[1]:.2f}\n"
-            result_str += f"  СУБД: {x[2]:.2f}\n"
-            result_str += f"Суммарные затраты: {sum(x):.2f} (из {budget})\n"
-            result_str += f"Максимальная прибыль: {total_profit:.2f}\n"
-            self.result_text.insert(tk.END, result_str)
-        else:
-            self.result_text.insert(tk.END, f"Решение не найдено.\nСообщение: {res.message}")
-
-
-# ----------------------------------------------------------------------
-# Модуль 4: Дашборд (визуализация)
-class DashboardWindow(tk.Toplevel):
-    """Обобщённая визуализация результатов всех модулей."""
-    def __init__(self, master):
-        super().__init__(master)
-        self.title("Визуализация данных (дашборд)")
-        self.geometry("900x600")
-        self.minsize(700, 500)
-
-        self.create_widgets()
-
-    def create_widgets(self):
-        ttk.Label(self, text="Обобщённая визуализация", font=('Arial', 12, 'bold')).pack(pady=5)
-
-        # Кнопка для обновления (построения демонстрационных графиков)
-        ttk.Button(self, text="Показать демо-графики", command=self.show_demo).pack(pady=5)
-
-        self.plot_frame = ttk.Frame(self)
-        self.plot_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        # При создании сразу показать демо
-        self.show_demo()
-
-    def show_demo(self):
-        """Создать три демонстрационных графика, иллюстрирующих работу системы."""
-        for widget in self.plot_frame.winfo_children():
-            widget.destroy()
-
-        fig = plt.Figure(figsize=(9, 6), dpi=100)
-        # График 1: пример радиальной диаграммы (оценка)
-        ax1 = fig.add_subplot(221, projection='polar')
-        self._demo_radar(ax1)
-
-        # График 2: пример прогноза
-        ax2 = fig.add_subplot(222)
-        self._demo_forecast(ax2)
-
-        # График 3: пример оптимизации (столбчатая диаграмма распределения)
-        ax3 = fig.add_subplot(223)
-        self._demo_optimization(ax3)
-
-        # График 4: общая информация
-        ax4 = fig.add_subplot(224)
-        ax4.axis('off')
-        text = "Информационно-аналитическая система\nВариант 20: Компания разработчик ПО\n\n"
-        text += "Функции:\n- Оценка качества ERP/CRM/СУБД\n- Прогноз показателей\n- Оптимизация ресурсов"
-        ax4.text(0.5, 0.5, text, ha='center', va='center', fontsize=10,
-                 bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
-
-        fig.tight_layout()
-
-        canvas = FigureCanvasTkAgg(fig, master=self.plot_frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-    def _demo_radar(self, ax):
-        """Демонстрационная радиальная диаграмма."""
-        categories = ['Модульность', 'Отклик', 'Пользователи', 'Надёжность', 'Цена']
-        N = len(categories)
-        angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist()
+            
+        self.df_norm = IndexEngine.normalize(self.df, FEATURES, DIRECTIONS)
+        self.index_scores = IndexEngine.calculate_composite_index(self.df_norm, FEATURES, self.weights)
+        
+        # --- Радарная диаграмма ---
+        self.ax_r.clear()
+        angles = np.linspace(0, 2*np.pi, len(FEATURES), endpoint=False).tolist()
         angles += angles[:1]
+        self.ax_r.set_xticks(angles[:-1])
+        
+        chart_labels = []
+        for f in FEATURES:
+            name = RU_NAMES[f]
+            if len(name) > 18:
+                parts = name.split()
+                mid = len(parts) // 2
+                chart_labels.append(" ".join(parts[:mid]) + "\n" + " ".join(parts[mid:]))
+            else:
+                chart_labels.append(name)
 
-        # Пример двух образцов
-        values1 = [0.9, 0.8, 0.7, 0.95, 0.6]
-        values2 = [0.7, 0.9, 0.6, 0.85, 0.8]
-        values1 += values1[:1]
-        values2 += values2[:1]
+        self.ax_r.set_xticklabels(chart_labels, fontsize=9, ha='center', va='top')
+        self.ax_r.set_ylim(0, 1.15)
+        self.ax_r.tick_params(axis='x', pad=15)
+        
+        for idx in range(min(6, len(self.df_norm))):
+            row = self.df_norm.iloc[idx]
+            v = row[FEATURES].tolist() + [row[FEATURES].tolist()[0]]
+            self.ax_r.plot(angles, v, 'o-', linewidth=2, label=f"Наблюдение {idx}")
+            self.ax_r.fill(angles, v, alpha=0.2)
+        self.ax_r.legend(loc='upper right', fontsize=7, bbox_to_anchor=(1.25, 1.15))
+        self.ax_r.set_title("Профили метрик (нормализованные)")
 
-        ax.plot(angles, values1, 'o-', linewidth=2, label='ERP Сириус')
-        ax.fill(angles, values1, alpha=0.1)
-        ax.plot(angles, values2, 'o-', linewidth=2, label='ERP Вектор')
-        ax.fill(angles, values2, alpha=0.1)
+        # --- Столбчатая диаграмма ---
+        self.ax_b.clear()
+        df_plot = pd.DataFrame({"№": self.df.index, "Индекс": self.index_scores.values}).sort_values("Индекс", ascending=False)
+        n_rows = len(df_plot)
+        step = max(1, n_rows // 14)
+        
+        self.ax_b.barh(df_plot["№"].astype(str), df_plot["Индекс"], color=plt.cm.viridis(np.linspace(0.3, 0.9, n_rows)))
+        self.ax_b.set_xlabel("Композитный индекс")
+        self.ax_b.set_title("Ранжирование наблюдений")
+        self.ax_b.set_xlim(0, 1)
+        
+        self.ax_b.set_yticks(range(0, n_rows, step))
+        self.ax_b.set_yticklabels(df_plot["№"].astype(str).iloc[::step], fontsize=7)
+        
+        for i, v in enumerate(df_plot["Индекс"]):
+            if i % step == 0:
+                self.ax_b.text(v + 0.01, i, f"{v:.3f}", va='center', fontsize=7)
+            
+        self.fig_idx.tight_layout(pad=2.0)
+        self.canvas_idx.draw()
+        self.lbl_status.config(text="✅ Индекс рассчитан", foreground="black")
 
-        ax.set_xticks(angles[:-1])
-        ax.set_xticklabels(categories)
-        ax.set_ylim(0, 1)
-        ax.set_title("Пример оценки качества ERP")
-        ax.legend(loc='upper right', bbox_to_anchor=(1.2, 1.0))
+    def _train_and_show_forecast(self):
+        if self.df is None:
+            messagebox.showwarning("Внимание", "Загрузите данные")
+            return
+        self.model_info = ForecastEngine.train_model(self.df, FEATURES, TARGET)
+        
+        txt = f"📊 Модель: LinearRegression (scikit-learn)\n"
+        txt += f"R² = {self.model_info['r2']:.3f} | MAE = {self.model_info['mae']:.2f} тыс. руб.\n"
+        txt += "Влияние метрик на выручку (коэффициенты):\n"
+        sorted_coeffs = sorted(self.model_info['coeffs'].items(), key=lambda x: abs(x[1]), reverse=True)
+        for f, c in sorted_coeffs:
+            txt += f"  • {RU_NAMES[f]}: {c:+.2f}\n"
+        self.lbl_model.config(text=txt, foreground="black")
+        
+        self.ax_fc.clear()
+        self.ax_fc.scatter(self.model_info['actual'], self.model_info['predicted'], alpha=0.6, color="#3498db", s=40)
+        min_v, max_v = min(self.model_info['actual']), max(self.model_info['actual'])
+        self.ax_fc.plot([min_v, max_v], [min_v, max_v], 'r--', linewidth=2, label="Идеальное совпадение")
+        self.ax_fc.set_xlabel("Фактическая выручка")
+        self.ax_fc.set_ylabel("Прогноз модели")
+        self.ax_fc.set_title(f"Факт vs Прогноз (R²={self.model_info['r2']:.3f})")
+        self.ax_fc.legend()
+        self.ax_fc.grid(True, alpha=0.3)
+        
+        self.fig_fc.tight_layout()
+        self.canvas_fc.draw()
 
-    def _demo_forecast(self, ax):
-        """Демонстрационный линейный прогноз."""
-        x = np.arange(6)
-        y = np.array([100, 115, 130, 145, 160, 175]) + np.random.normal(0, 5, 6)
-        ax.plot(x, y, 'bo-', label='История')
-        coeffs = np.polyfit(x, y, 1)
-        trend = np.polyval(coeffs, np.arange(9))
-        ax.plot(np.arange(9), trend, 'g--', label='Тренд')
-        ax.plot([6,7,8], trend[6:], 'ro', label='Прогноз')
-        ax.set_xlabel("Месяц")
-        ax.set_ylabel("Продажи")
-        ax.set_title("Прогноз продаж")
-        ax.legend()
-        ax.grid(True)
+    def _run_scenario(self):
+        if self.model_info is None:
+            messagebox.showwarning("Внимание", "Сначала обучите модель")
+            return
+        try:
+            base = {f: self.df[f].mean() for f in FEATURES}
+            scenario = base.copy()
+            for met in CONTROLLABLE:
+                val = float(self.entries[met].get())
+                scenario[met] = val
+                
+            X_base = np.array([[base[f] for f in FEATURES]])
+            X_sc = np.array([[scenario[f] for f in FEATURES]])
+            
+            pred_base = self.model_info['model'].predict(X_base)[0]
+            pred_sc = self.model_info['model'].predict(X_sc)[0]
+            delta = pred_sc - pred_base
+            
+            EPS = 0.1 
+            
+            if delta > EPS:
+                sign = "↑"
+                scenario_color = "#27ae60"
+                txt_color = "green"
+            elif delta < -EPS:
+                sign = "↓"
+                scenario_color = "#e74c3c"
+                txt_color = "red"
+            else:
+                sign = "≈"
+                scenario_color = "#95a5a6"
+                txt_color = "gray"
+            
+            txt = f"Базовый прогноз: {pred_base:.0f} тыс. руб.\n"
+            txt += f"Сценарий: {pred_sc:.0f} тыс. руб. {sign} {abs(delta):.0f} тыс. руб.\n"
+            txt += f"Изменения: {', '.join([f'{RU_NAMES[m]}: {base[m]:.3f} → {scenario[m]:.3f}' for m in CONTROLLABLE])}"
+            self.lbl_scenario.config(text=txt, foreground=txt_color)
+            
+            self.ax_sc.clear()
+            self.ax_sc.bar(["Базовый", "Сценарий"], [pred_base, pred_sc], 
+                           color=["#95a5a6", scenario_color])
+            self.ax_sc.set_ylabel("Выручка (тыс. руб.)")
+            self.ax_sc.set_title(f"Сравнение сценариев ({sign} {abs(delta):.0f})")
+            self.ax_sc.grid(axis='y', alpha=0.3)
+            
+            self.fig_sc.tight_layout()
+            self.canvas_sc.draw()
+        except Exception as e:
+            messagebox.showerror("Ошибка сценария", f"Проверьте ввод чисел:\n{e}")
 
-    def _demo_optimization(self, ax):
-        """Демонстрационная диаграмма распределения бюджета."""
-        projects = ['ERP', 'CRM', 'СУБД']
-        allocation = [350, 250, 400]
-        bars = ax.bar(projects, allocation, color=['#1f77b4', '#ff7f0e', '#2ca02c'])
-        ax.set_ylabel("Бюджет, тыс. руб")
-        ax.set_title("Оптимальное распределение бюджета")
-        for bar, val in zip(bars, allocation):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 5,
-                    str(val), ha='center', va='bottom')
+    def _export_json(self):
+        if self.index_scores is None:
+            messagebox.showwarning("Внимание", "Сначала рассчитайте индекс")
+            return
+        fp = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
+        if not fp: return
+        report = {
+            "system": "SaaS Analytics (Композитный индекс)",
+            "date": datetime.datetime.now().isoformat(),
+            "weights": self.weights.tolist(),
+            "forecast_r2": self.model_info["r2"] if self.model_info else None,
+            "composite_index": {int(idx): round(val, 4) for idx, val in self.index_scores.items()}
+        }
+        with open(fp, 'w', encoding='utf-8') as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        messagebox.showinfo("Успех", f"Отчёт сохранён в {fp}")
 
-
-# ----------------------------------------------------------------------
-# Точка входа
 if __name__ == "__main__":
-    app = MainApp()
-    app.mainloop()
+    root = tk.Tk()
+    app = SaaSAnalyticsApp(root)
+    root.mainloop()
